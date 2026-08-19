@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated artefacts. results/ IS committed — every figure in the docs must be
+# traceable to the run that produced it. The rendered report and any local
+# Spark event logs are derived from it and are not.
+reports/strata.html
+spark-events/
+warehouse/
+derby.log
+metastore_db/
+
+# Container state
+docker/volumes/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local scratch
+*.log
+!docs/**/*.log

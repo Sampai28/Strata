@@ -1,0 +1,336 @@
+# Strata cluster.
+#
+# Every service carries an explicit mem_limit and cpus, sourced from
+# configs/tier.env. Nothing runs unbounded: on a 15 GiB WSL2 VM, one unbounded
+# JVM sizing itself from "available" memory is enough to make the whole stack
+# swap, and a swapping cluster produces timings that measure the page cache
+# rather than the storage layout.
+#
+# Images are the official Apache publications (apache/hadoop, apache/hive,
+# apache/spark) plus stock postgres. The two Dockerfiles under docker/ add
+# exactly one jar each to the official base and change nothing else.
+
+# IMPORTANT: this file must be invoked with an explicit --env-file, because
+# `env_file:` on a service only sets variables INSIDE that container — it does
+# not supply the ${VAR} interpolation used for mem_limit and cpus below. Compose
+# resolves those from the shell or from --env-file only. Always go through the
+# Makefile, or run:
+#
+#     docker compose --env-file configs/tier.env -f docker/docker-compose.yml up -d
+#
+# Without it every limit interpolates to an empty string and compose fails
+# parsing cpus, which is a confusing error for a missing flag.
+
+name: strata
+
+volumes:
+  namenode-data:
+  datanode-data:
+  postgres-data:
+
+networks:
+  strata:
+    driver: bridge
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # HDFS
+  # ---------------------------------------------------------------------------
+  namenode:
+    build:
+      context: ./hadoop
+    image: strata/hadoop:3.3.6
+    hostname: namenode
+    container_name: strata-namenode
+    command: ["hdfs", "namenode"]
+    environment:
+      # The entrypoint formats only when this directory is ABSENT. The volume is
+      # therefore mounted at /hadoop/dfs — one level up — so that name/ does not
+      # exist inside a fresh volume and the format fires exactly once on a cold
+      # start. Mounting the volume directly here would silently skip the format.
+      # See docker/hadoop/Dockerfile for the full story.
+      ENSURE_NAMENODE_DIR: "/hadoop/dfs/name"
+      HADOOP_HEAPSIZE_MAX: "${HADOOP_HEAP}"
+    env_file:
+      - ../configs/tier.env
+      - ./hadoop.env
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    volumes:
+      - namenode-data:/hadoop/dfs
+    mem_limit: ${NAMENODE_MEM}
+    cpus: ${NAMENODE_CPUS}
+    networks: [strata]
+    healthcheck:
+      # Safe mode OFF is the real readiness signal. The RPC port opens well
+      # before the NameNode will accept writes, so a port check here would let
+      # the DataNode and every downstream job start into a filesystem that
+      # rejects them.
+      test: ["CMD-SHELL", "hdfs dfsadmin -safemode get 2>/dev/null | grep -q OFF"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  datanode:
+    build:
+      context: ./hadoop
+    image: strata/hadoop:3.3.6
+    hostname: datanode
+    container_name: strata-datanode
+    command: ["hdfs", "datanode"]
+    environment:
+      HADOOP_HEAPSIZE_MAX: "${HADOOP_HEAP}"
+    env_file:
+      - ../configs/tier.env
+      - ./hadoop.env
+    ports:
+      - "9864:9864"
+    volumes:
+      # Same one-level-up mount as the NameNode, for the ownership reason rather
+      # than the format reason — the DataNode creates its own data/ subdirectory
+      # but cannot do so inside a root-owned volume.
+      - datanode-data:/hadoop/dfs
+    mem_limit: ${DATANODE_MEM}
+    cpus: ${DATANODE_CPUS}
+    networks: [strata]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9864' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Hive Metastore + HiveServer2
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    hostname: postgres
+    container_name: strata-postgres
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      # The metastore schema is ASCII; setting this explicitly avoids a locale
+      # mismatch between initdb and the schematool DDL.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    mem_limit: ${POSTGRES_MEM}
+    cpus: ${POSTGRES_CPUS}
+    networks: [strata]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  metastore:
+    build:
+      context: ./hive
+    image: strata/hive:4.0.0
+    hostname: metastore
+    container_name: strata-metastore
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      # The image runs `schematool -initSchema` on first start when the backing
+      # schema is absent, and skips it when present. That is why postgres must be
+      # healthy first rather than merely started.
+      SERVICE_OPTS: >-
+        -Xmx${HIVE_HEAP}
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+        -Dhive.metastore.warehouse.dir=hdfs://namenode:8020/strata/warehouse
+    env_file:
+      - ../configs/tier.env
+    ports:
+      - "9083:9083"
+    mem_limit: ${METASTORE_MEM}
+    cpus: ${METASTORE_CPUS}
+    networks: [strata]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9083' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  hiveserver2:
+    build:
+      context: ./hive
+    image: strata/hive:4.0.0
+    hostname: hiveserver2
+    container_name: strata-hiveserver2
+    environment:
+      SERVICE_NAME: hiveserver2
+      # IS_RESUME stops this container attempting its own schema init against a
+      # metastore that already owns the schema. Two processes racing schematool
+      # leaves the schema half-created and both of them dead.
+      IS_RESUME: "true"
+      SERVICE_OPTS: >-
+        -Xmx${HIVE_HEAP}
+        -Dhive.metastore.uris=thrift://metastore:9083
+    env_file:
+      - ../configs/tier.env
+    ports:
+      - "10000:10000"
+      - "10002:10002"
+    volumes:
+      - ../sql:/opt/strata/sql:ro
+    mem_limit: ${HIVESERVER2_MEM}
+    cpus: ${HIVESERVER2_CPUS}
+    networks: [strata]
+    depends_on:
+      metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/10000' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Spark
+  # ---------------------------------------------------------------------------
+  spark-master:
+    build:
+      context: ./spark
+    image: strata/spark:3.5.3
+    hostname: spark-master
+    container_name: strata-spark-master
+    # spark-class in the foreground rather than sbin/start-master.sh, which
+    # daemonises and would leave the container with no process to supervise.
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    env_file:
+      - ../configs/tier.env
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    mem_limit: ${SPARK_MASTER_MEM}
+    cpus: ${SPARK_MASTER_CPUS}
+    networks: [strata]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8080' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  spark-worker:
+    build:
+      context: ./spark
+    image: strata/spark:3.5.3
+    hostname: spark-worker
+    container_name: strata-spark-worker
+    command:
+      - "/opt/spark/bin/spark-class"
+      - "org.apache.spark.deploy.worker.Worker"
+      - "spark://spark-master:7077"
+    environment:
+      SPARK_WORKER_MEMORY: "${SPARK_WORKER_MEMORY}"
+      SPARK_WORKER_CORES: "${SPARK_WORKER_CORES}"
+      SPARK_NO_DAEMONIZE: "true"
+    env_file:
+      - ../configs/tier.env
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    mem_limit: ${SPARK_WORKER_MEM}
+    cpus: ${SPARK_WORKER_CPUS}
+    networks: [strata]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8081' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  spark-history:
+    build:
+      context: ./spark
+    image: strata/spark:3.5.3
+    hostname: spark-history
+    container_name: strata-spark-history
+    # Behind a profile so this is the first thing to drop if memory gets tight.
+    # Nothing depends on it: the metrics layer parses the event logs directly
+    # from HDFS, so losing the UI costs inspection convenience, not data.
+    profiles: ["history", "full"]
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_HISTORY_OPTS: "-Dspark.history.fs.logDirectory=hdfs://namenode:8020/spark-events"
+    env_file:
+      - ../configs/tier.env
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    mem_limit: ${SPARK_HISTORY_MEM}
+    cpus: ${SPARK_HISTORY_CPUS}
+    networks: [strata]
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Job submission client
+  # ---------------------------------------------------------------------------
+  spark-client:
+    build:
+      context: ./spark
+    image: strata/spark:3.5.3
+    hostname: spark-client
+    container_name: strata-spark-client
+    # Idles so that `docker compose exec` can submit into it repeatedly. Running
+    # each job as `compose run` instead would pay container startup on every
+    # experiment, which at smoke scale is a meaningful share of the measured
+    # duration.
+    command: ["sleep", "infinity"]
+    environment:
+      PYTHONPATH: "/opt/strata/src"
+      PYSPARK_PYTHON: "python3"
+      PYSPARK_DRIVER_PYTHON: "python3"
+      STRATA_CONFIG: "/opt/strata/configs/smoke.yaml"
+    env_file:
+      - ../configs/tier.env
+    volumes:
+      # The repo, live. Editing a job on the host and re-running it needs no
+      # rebuild, which matters when iterating on five experiments.
+      - ..:/opt/strata
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    working_dir: /opt/strata
+    mem_limit: ${SPARK_CLIENT_MEM}
+    cpus: ${SPARK_CLIENT_CPUS}
+    networks: [strata]
+    depends_on:
+      spark-worker:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
