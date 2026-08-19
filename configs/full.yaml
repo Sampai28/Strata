@@ -1,0 +1,84 @@
+# Full scale. NOT run automatically — invoke deliberately with:
+#
+#     make bench-full CONFIG=configs/full.yaml
+#
+# Budget several hours and a few hundred GB of disk. docs/expected-results.md
+# reasons about what this should produce and why; those figures are projections
+# until this config has actually been run.
+#
+# Before running, raise the WSL2 memory allocation (see docs/wslconfig-recommended)
+# and switch the compose tier to `large` in configs/tier.env, or the Spark worker
+# will spill continuously and the numbers will measure disk rather than layout.
+
+scale: full
+seed: 20240917
+
+data:
+  # 50M is the low end. 200M is viable on this hardware but expect the generator
+  # alone to run for a long time and the format experiment to dominate the suite.
+  fact_rows: 50000000
+  stores: 1000
+  products: 50000
+  members: 1000000
+  start_date: "2019-01-01"
+  end_date: "2024-12-31"
+
+  skew:
+    hot_stores: 8
+    hot_share: 0.40
+
+  dirt:
+    duplicate_rate: 0.004
+    orphan_product_rate: 0.003
+    negative_quantity_rate: 0.002
+    null_member_rate: 0.005
+    out_of_range_date_rate: 0.001
+    late_arriving_rate: 0.02
+
+spark:
+  master: "spark://spark-master:7077"
+  app_name: "strata-full"
+  driver_memory: "2g"
+  executor_memory: "8g"
+  executor_cores: 4
+  # ~2-3x total cores. At 50M rows this keeps partitions in the low hundreds of
+  # MB, which is where shuffle behaves.
+  shuffle_partitions: 64
+  event_log_dir: "hdfs://namenode:8020/spark-events"
+  rest_url: "http://spark-master:8080"
+  history_url: "http://spark-history:18080"
+
+paths:
+  root: "hdfs://namenode:8020/strata-full"
+  raw: "hdfs://namenode:8020/strata-full/raw"
+  curated: "hdfs://namenode:8020/strata-full/curated"
+  quarantine: "hdfs://namenode:8020/strata-full/quarantine"
+  quality: "hdfs://namenode:8020/strata-full/quality"
+  experiments: "hdfs://namenode:8020/strata-full/experiments"
+
+experiments:
+  exp1:
+    over_partition_key: "product_id"
+    date_from: "2024-03-01"
+    date_to: "2024-03-31"
+  exp2:
+    formats:
+      - "parquet-snappy"
+      - "parquet-zstd"
+      - "orc-snappy"
+      - "orc-zstd"
+      - "avro"
+      - "csv"
+    projection_column: "amount"
+    filter_column: "store_id"
+  exp3:
+    # 20000 files at full scale is a realistic reproduction of what a badly
+    # configured hourly ingest produces over a couple of years.
+    small_file_partitions: 20000
+    target_file_mb: 128
+  exp4:
+    join_key: "member_id"
+    buckets: 256
+  exp5:
+    salt_buckets: 64
+    broadcast_threshold_mb: 64

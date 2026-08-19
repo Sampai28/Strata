@@ -1,0 +1,89 @@
+# Smoke scale — the default. Sized so the whole suite finishes in minutes on a
+# laptop, while still being large enough that the layout effects are real rather
+# than noise.
+#
+# The fact table is ~500K rows. That is small enough that some effects (task
+# scheduling overhead, JVM warmup) are a visible fraction of total runtime.
+# That is not a flaw in the measurement, it is a property of this scale, and the
+# experiment writeups say so where it matters.
+
+scale: smoke
+seed: 20240917
+
+data:
+  fact_rows: 500000
+  stores: 200
+  products: 5000
+  members: 20000
+  start_date: "2023-01-01"
+  end_date: "2024-12-31"
+
+  # A handful of stores hold a disproportionate share of rows, so partition and
+  # join skew is observable rather than theoretical. Without this, experiment 5
+  # has nothing to demonstrate: uniformly distributed synthetic data does not
+  # produce stragglers.
+  skew:
+    hot_stores: 4
+    hot_share: 0.40
+
+  # Deliberate defects, so the quality layer has something to reject. A gate
+  # that has never fired has not been tested.
+  dirt:
+    duplicate_rate: 0.004
+    orphan_product_rate: 0.003
+    negative_quantity_rate: 0.002
+    null_member_rate: 0.005
+    out_of_range_date_rate: 0.001
+    late_arriving_rate: 0.02
+
+spark:
+  master: "spark://spark-master:7077"
+  app_name: "strata"
+  driver_memory: "1g"
+  executor_memory: "3g"
+  executor_cores: 2
+  # 16 rather than the default 200. At 500K rows, 200 shuffle partitions means
+  # 200 tasks each handling a few thousand rows, where scheduling overhead
+  # dominates the actual work.
+  shuffle_partitions: 16
+  event_log_dir: "hdfs://namenode:8020/spark-events"
+  rest_url: "http://spark-master:8080"
+  history_url: "http://spark-history:18080"
+
+paths:
+  root: "hdfs://namenode:8020/strata"
+  raw: "hdfs://namenode:8020/strata/raw"
+  curated: "hdfs://namenode:8020/strata/curated"
+  quarantine: "hdfs://namenode:8020/strata/quarantine"
+  quality: "hdfs://namenode:8020/strata/quality"
+  experiments: "hdfs://namenode:8020/strata/experiments"
+
+experiments:
+  exp1:
+    # product_id has 5000 distinct values at smoke scale; partitioning a 500K-row
+    # table by it yields ~5000 directories of ~100 rows each. That is the
+    # pathology this variant exists to measure.
+    over_partition_key: "product_id"
+    date_from: "2024-03-01"
+    date_to: "2024-03-31"
+  exp2:
+    formats:
+      - "parquet-snappy"
+      - "parquet-zstd"
+      - "orc-snappy"
+      - "orc-zstd"
+      - "avro"
+      - "csv"
+    projection_column: "amount"
+    filter_column: "store_id"
+  exp3:
+    # Forces ~600 output files at smoke scale, each a few KB — far below the
+    # 128MB HDFS block size.
+    small_file_partitions: 600
+    target_file_mb: 128
+  exp4:
+    join_key: "member_id"
+    buckets: 16
+  exp5:
+    salt_buckets: 16
+    broadcast_threshold_mb: 16

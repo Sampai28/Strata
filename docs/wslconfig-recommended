@@ -1,0 +1,46 @@
+# Recommended .wslconfig for Strata
+#
+# NOT INSTALLED. Copy to %USERPROFILE%\.wslconfig yourself, then run
+# `wsl --shutdown` and start Docker Desktop again. WSL2 only reads this at VM
+# start, so editing it while containers are running changes nothing.
+#
+# Why this file exists at all: with the WSL2 backend, container memory and CPU
+# come from the WSL2 VM, not from Docker Desktop's Resources sliders — those are
+# disabled in that mode. Docker will report whatever WSL2 was given. On a 31.3 GB
+# host with no .wslconfig, WSL2 takes its default of half the host, which is why
+# `docker info` reported 15.27 GiB and Strata selected the medium tier.
+#
+# Installing this raises the VM to 20 GB, which is enough for the large tier
+# (two Spark workers, bigger Hadoop and Hive heaps). After installing:
+#
+#     cp configs/tier-large.env configs/tier.env
+#     make up
+#
+# 20 GB of 31.3 GB leaves ~11 GB for Windows itself. Going much higher starves
+# the host and the machine begins swapping, which makes every timing in the
+# experiments a measurement of the pagefile.
+
+[wsl2]
+
+# The ceiling for the VM, not a reservation — WSL2 claims pages as needed.
+memory=20GB
+
+# 12 of 16 logical processors. Leaving four for Windows keeps the desktop
+# responsive during a full-scale run, and Spark gains little from the last few
+# once it is I/O bound.
+processors=12
+
+# Swap inside the VM. Kept modest on purpose: a Spark executor that spills to
+# swap rather than failing produces timings that look like a slow query instead
+# of the memory problem it is. 8 GB is enough to absorb a transient spike
+# without hiding a persistent one.
+swap=8GB
+
+# Reclaim freed memory back to Windows instead of holding it for the VM's
+# lifetime. Without this, a full-scale run leaves the VM holding its peak
+# allocation until you restart WSL.
+autoMemoryReclaim=gradual
+
+# Report the VM's real memory to processes inside it. Without this, JVMs sizing
+# heaps from "available memory" read the host's total and over-allocate.
+nestedVirtualization=false

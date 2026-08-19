@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strata"
+version = "0.1.0"
+description = "Hadoop storage-layout laboratory: partitioning, file format, file size, bucketing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Deliberately empty. The Spark jobs run inside the apache/spark container and
+# must not depend on anything that is not already there — see src/strata/config.py
+# for the hand-rolled YAML reader that exists for exactly this reason. Host-side
+# tooling (dashboard, report, tests) is in the optional groups below.
+dependencies = []
+
+[project.optional-dependencies]
+# Host-side only. None of this is importable from inside the Spark containers
+# and no Spark job may import it.
+viz = [
+    "streamlit>=1.32",
+    "plotly>=5.18",
+    "pandas>=2.1",
+]
+dev = [
+    "pytest>=8",
+    "pyspark==3.5.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "spark: needs a local PySpark session (slow, no cluster required)",
+    "cluster: needs the docker compose stack running",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]
